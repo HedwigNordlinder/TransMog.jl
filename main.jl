@@ -69,13 +69,14 @@ sampleQ(n) = Flowfusion.random_literal_cat(n, sigma = 0.05f0)
 # The conditional is Gaussian with
 #   mean_{t|s} = mean_t + ((1-t)/(1-s)) (Y_s - mean_s)
 #   var_{t|s}  = σ² (t-s)(1-t) / (1-s).
-function sample_bridge_batch(batch_size; σ = 0.15f0)
+function sample_bridge_batch(batch_size; σ = 0.15f0, w_max = 1f0)
     Y0 = sampleP(batch_size)
     Y1 = sampleQ(batch_size)
-    r1 = rand(Float32, batch_size)
-    r2 = rand(Float32, batch_size)
-    s  = min.(r1, r2)
-    t  = max.(r1, r2)
+    # Curriculum: restrict t - s ≤ w_max. Sample s uniform, then t uniform in
+    # [s, min(1, s + w_max)].
+    s   = rand(Float32, batch_size)
+    gap = min.(w_max, 1f0 .- s)
+    t   = s .+ rand(Float32, batch_size) .* gap
     sr = reshape(s, 1, :)
     tr = reshape(t, 1, :)
     mean_s = (1f0 .- sr) .* Y0 .+ sr .* Y1
@@ -228,12 +229,12 @@ end
 # ============================================================
 # Training
 # ============================================================
-function sample_times(batch_size)
-    s  = rand(Float32, batch_size)
-    τ1 = rand(Float32, batch_size)
-    τ2 = rand(Float32, batch_size)
-    u  = s .+ (1f0 .- s) .* min.(τ1, τ2)
-    t  = s .+ (1f0 .- s) .* max.(τ1, τ2)
+function sample_times(batch_size; w_max = 1f0)
+    # Curriculum: t - s ≤ w_max, with u uniform on [s, t].
+    s   = rand(Float32, batch_size)
+    gap = min.(w_max, 1f0 .- s)
+    t   = s .+ rand(Float32, batch_size) .* gap
+    u   = s .+ rand(Float32, batch_size) .* (t .- s)
     return s, u, t
 end
 
@@ -247,6 +248,8 @@ function train_kernel!(model;
         warmup_epochs = 1,
         n_middle = 4,
         σ_bridge = 0.15f0,
+        w_start = 0.1f0,
+        w_end   = 1f0,
     )
     opt_state = Flux.setup(AdamW(eta = eta), model)
     losses = Float32[]
@@ -259,16 +262,20 @@ function train_kernel!(model;
         else
             Float32(λ_ck_max * min(1f0, (epoch - warmup_epochs) / max(1, n_epochs - warmup_epochs)))
         end
+        # Curriculum: widen the (s, t) interval window linearly from w_start (epoch 1)
+        # to w_end (epoch n_epochs). Short intervals are easier kernels to fit — the
+        # model builds up shorter transitions first and extends to the full horizon.
+        w_max = Float32(w_start + (epoch - 1) * (w_end - w_start) / max(1, n_epochs - 1))
         for i in 1:iters_per_epoch
             Y0_cpu, _Y1, s_mle_cpu, t_mle_cpu, Ys_cpu, Yt_cpu =
-                sample_bridge_batch(batch_size; σ = σ_bridge)
+                sample_bridge_batch(batch_size; σ = σ_bridge, w_max = w_max)
             Y0    = Y0_cpu    |> gpu
             s_mle = s_mle_cpu |> gpu
             t_mle = t_mle_cpu |> gpu
             Ys    = Ys_cpu    |> gpu
             Yt    = Yt_cpu    |> gpu
 
-            s_cpu, u_cpu, t_ck_cpu = sample_times(batch_size)
+            s_cpu, u_cpu, t_ck_cpu = sample_times(batch_size; w_max = w_max)
             s    = s_cpu    |> gpu
             u    = u_cpu    |> gpu
             t_ck = t_ck_cpu |> gpu
@@ -294,6 +301,7 @@ function train_kernel!(model;
             recent = length(losses) >= 100 ? sum(@view losses[end-99:end]) / 100 : l
             next!(prog; showvalues = [
                 (:epoch, "$epoch/$n_epochs"),
+                (:w_max, round(w_max; digits = 3)),
                 (:λ_ck,  round(λ_ck; digits = 4)),
                 (:iter,  "$i/$iters_per_epoch"),
                 (:total, round(l;          digits = 4)),
@@ -328,6 +336,24 @@ function generate(model, X0; n_steps = 100)
         X = sample_mog(μ, ld, tr, lw)
     end
     return X
+end
+
+# Same rollout, but keeps every intermediate state (including the initial X0 and final X1).
+# Returns (states, ts) where states[i] corresponds to time ts[i].
+function generate_with_trace(model, X0; n_steps = 5)
+    ts = Float32.(range(0f0, 1f0, length = n_steps + 1))
+    states = Vector{typeof(X0)}(undef, n_steps + 1)
+    states[1] = X0
+    X = X0
+    for i in 1:n_steps
+        B = size(X, 2)
+        s = fill(ts[i],   B)
+        t = fill(ts[i+1], B)
+        μ, ld, tr, lw = model(s, t, ContinuousState(X))
+        X = sample_mog(μ, ld, tr, lw)
+        states[i+1] = X
+    end
+    return states, ts
 end
 
 # ============================================================
@@ -370,3 +396,24 @@ title!(rollout_plot, "$(n_rollout_steps)-step rollout (CK diagnostic)")
 sample_plot = plot(oneshot_plot, rollout_plot; layout = (1, 2), size = (1000, 500))
 savefig(sample_plot, "generated_samples.png")
 display(sample_plot)
+
+# Per-step rollout trace: one subplot per time step, showing X0 & X1_true faintly in the
+# background and the current rolled-out state in green.
+rollout_states, rollout_ts = generate_with_trace(model, X0_eval; n_steps = n_rollout_steps)
+step_plots = [begin
+    p = scatter(X0_eval[1, :], X0_eval[2, :]; ms = 1, msw = 0,
+                color = :blue,   alpha = 0.2, label = "",
+                size = (300, 300), legend = false)
+    scatter!(p, X1_true[1, :], X1_true[2, :]; ms = 1, msw = 0,
+             color = :orange, alpha = 0.3, label = "")
+    scatter!(p, Xi[1, :], Xi[2, :];         ms = 1, msw = 0,
+             color = :green,  alpha = 0.6, label = "")
+    title!(p, "t = $(round(rollout_ts[i]; digits = 2))")
+    p
+end for (i, Xi) in enumerate(rollout_states)]
+
+rollout_trace_plot = plot(step_plots...;
+                          layout = (1, length(step_plots)),
+                          size   = (250 * length(step_plots), 300))
+savefig(rollout_trace_plot, "rollout_steps.png")
+display(rollout_trace_plot)
