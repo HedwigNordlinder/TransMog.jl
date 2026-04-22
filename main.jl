@@ -60,15 +60,34 @@ end
 sampleP(n) = rand(Float32, 2, n) .+ 2f0
 sampleQ(n) = Flowfusion.random_literal_cat(n, sigma = 0.05f0)
 
+# Joint Brownian-bridge sample of (Y_s, Y_t) pinned at (Y_0, Y_1), with 0 ≤ s ≤ t ≤ 1.
+# Under the bridge, (Y_s, Y_t) | (Y_0, Y_1) is Gaussian with
+#   mean_u     = (1-u) Y_0 + u Y_1                  for u ∈ {s, t}
+#   Var(Y_s)   = σ² s(1-s)
+#   Cov(Y_s,Y_t) = σ² s(1-t)
+# Sampled factorized: Y_s from its marginal, then Y_t | Y_s.
+# The conditional is Gaussian with
+#   mean_{t|s} = mean_t + ((1-t)/(1-s)) (Y_s - mean_s)
+#   var_{t|s}  = σ² (t-s)(1-t) / (1-s).
 function sample_bridge_batch(batch_size; σ = 0.15f0)
     Y0 = sampleP(batch_size)
     Y1 = sampleQ(batch_size)
-    t  = rand(Float32, batch_size)
+    r1 = rand(Float32, batch_size)
+    r2 = rand(Float32, batch_size)
+    s  = min.(r1, r2)
+    t  = max.(r1, r2)
+    sr = reshape(s, 1, :)
     tr = reshape(t, 1, :)
-    mean_bridge = (1f0 .- tr) .* Y0 .+ tr .* Y1
-    std_bridge  = σ .* sqrt.(max.(tr .* (1f0 .- tr), 0f0))
-    Yt = mean_bridge .+ std_bridge .* randn(Float32, size(Y0)...)
-    return Y0, Y1, t, Yt
+    mean_s = (1f0 .- sr) .* Y0 .+ sr .* Y1
+    mean_t = (1f0 .- tr) .* Y0 .+ tr .* Y1
+    std_s  = σ .* sqrt.(max.(sr .* (1f0 .- sr), 0f0))
+    Y_s = mean_s .+ std_s .* randn(Float32, size(Y0)...)
+    one_minus_s = max.(1f0 .- sr, 1f-6)                        # guard s → 1
+    scale    = (1f0 .- tr) ./ one_minus_s
+    std_cond = σ .* sqrt.(max.((tr .- sr) .* (1f0 .- tr) ./ one_minus_s, 0f0))
+    mean_cond = mean_t .+ scale .* (Y_s .- mean_s)
+    Y_t = mean_cond .+ std_cond .* randn(Float32, size(Y0)...)
+    return Y0, Y1, s, t, Y_s, Y_t
 end
 
 # ============================================================
@@ -185,10 +204,9 @@ end
 # Losses
 # ============================================================
 
-function bridge_mle_loss(model, Y0, t, Yt)
-    s = Zygote.ignore_derivatives(() -> fill!(similar(t), 0f0))
-    μ, ld, tr, lw = model(s, t, ContinuousState(Y0))
-    -mean(mog_logpdf_chol(Yt, μ, ld, tr, lw))
+function bridge_mle_loss(model, Y_s, s, t, Y_t)
+    μ, ld, tr, lw = model(s, t, ContinuousState(Y_s))
+    -mean(mog_logpdf_chol(Y_t, μ, ld, tr, lw))
 end
 
 function ck_loggap_loss(model, Xs, s, u, t; n_middle = 4)
@@ -242,9 +260,12 @@ function train_kernel!(model;
             Float32(λ_ck_max * min(1f0, (epoch - warmup_epochs) / max(1, n_epochs - warmup_epochs)))
         end
         for i in 1:iters_per_epoch
-            Y0_cpu, _Y1, t_mle_cpu, Yt_cpu = sample_bridge_batch(batch_size; σ = σ_bridge)
+            Y0_cpu, _Y1, s_mle_cpu, t_mle_cpu, Ys_cpu, Yt_cpu =
+                sample_bridge_batch(batch_size; σ = σ_bridge)
             Y0    = Y0_cpu    |> gpu
+            s_mle = s_mle_cpu |> gpu
             t_mle = t_mle_cpu |> gpu
+            Ys    = Ys_cpu    |> gpu
             Yt    = Yt_cpu    |> gpu
 
             s_cpu, u_cpu, t_ck_cpu = sample_times(batch_size)
@@ -259,13 +280,13 @@ function train_kernel!(model;
             end
 
             l, g = Flux.withgradient(model) do m
-                L_mle = bridge_mle_loss(m, Y0, t_mle, Yt)
+                L_mle = bridge_mle_loss(m, Ys, s_mle, t_mle, Yt)
                 L_ck  = λ_ck > 0 ? ck_loggap_loss(m, Xs, s, u, t_ck; n_middle = n_middle) : 0f0
                 λ_mle * L_mle + λ_ck * L_ck
             end
             Flux.update!(opt_state, model, g[1])
 
-            L_mle_val = bridge_mle_loss(model, Y0, t_mle, Yt) |> cpu
+            L_mle_val = bridge_mle_loss(model, Ys, s_mle, t_mle, Yt) |> cpu
             push!(mle_losses, Float32(L_mle_val))
             push!(ck_losses,  λ_ck > 0 ? Float32(l - λ_mle * L_mle_val) / max(λ_ck, 1f-8) : 0f0)
             push!(losses, l)
