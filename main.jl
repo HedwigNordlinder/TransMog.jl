@@ -19,7 +19,7 @@ struct TransMogModel{A}
 end
 
 Flux.@layer TransMogModel
-function TransMogModel(; embeddim = 512, spacedim = 2, layers = 3, n_gaussians = 100)
+function TransMogModel(; embeddim = 128, spacedim = 2, layers = 3, n_gaussians = 20)
     embed_time_t = Chain(RandomFourierFeatures(1 => embeddim, 1f0), Dense(embeddim => embeddim, swish))
     embed_time_s = Chain(RandomFourierFeatures(1 => embeddim, 1f0), Dense(embeddim => embeddim, swish))
     embed_state = Chain(RandomFourierFeatures(spacedim => embeddim, 1f0), Dense(embeddim => embeddim, swish))
@@ -213,7 +213,7 @@ function train_kernel!(model;
             l, g = Flux.withgradient(model) do m
                 L_mle = bridge_mle_loss(m, Y0, t_mle, Yt)
                 L_ck  = λ_ck > 0 ? ck_loggap_loss(m, Xs, s, u, t_ck; n_middle = n_middle) : 0f0
-                λ_mle * L_mle + λ_ck * L_ck
+                λ_mle * L_mle #+ λ_ck * L_ck
             end
             Flux.update!(opt_state, model, g[1])
 
