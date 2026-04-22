@@ -213,7 +213,7 @@ function train_kernel!(model;
             l, g = Flux.withgradient(model) do m
                 L_mle = bridge_mle_loss(m, Y0, t_mle, Yt)
                 L_ck  = λ_ck > 0 ? ck_loggap_loss(m, Xs, s, u, t_ck; n_middle = n_middle) : 0f0
-                λ_mle * L_mle #+ λ_ck * L_ck
+                λ_mle * L_mle + λ_ck * L_ck
             end
             Flux.update!(opt_state, model, g[1])
 
