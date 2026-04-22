@@ -12,26 +12,36 @@ CUDA.device!(0)
 @info "Using GPU 0: $(CUDA.name(CUDA.device()))"
 
 # ============================================================
-# Kernel network (unchanged — learns K^θ_{s,t}(·|x_s) as a diagonal MoG)
+# Kernel network — learns K^θ_{s,t}(·|x_s) as a MoG with FULL diagonal covariance
+# parameterized through the lower-triangular Cholesky factor L  (Σ = L Lᵀ).
 # ============================================================
 struct TransMogModel{A}
-    layers::A 
+    layers::A
 end
 
 Flux.@layer TransMogModel
 function TransMogModel(; embeddim = 128, spacedim = 2, layers = 3, n_gaussians = 20)
+    D     = spacedim
+    n_off = D * (D - 1) ÷ 2                      # strict lower-tri entries per component
     embed_time_t = Chain(RandomFourierFeatures(1 => embeddim, 1f0), Dense(embeddim => embeddim, swish))
     embed_time_s = Chain(RandomFourierFeatures(1 => embeddim, 1f0), Dense(embeddim => embeddim, swish))
-    embed_state = Chain(RandomFourierFeatures(spacedim => embeddim, 1f0), Dense(embeddim => embeddim, swish))
+    embed_state  = Chain(RandomFourierFeatures(spacedim => embeddim, 1f0), Dense(embeddim => embeddim, swish))
     projection_layer = Dense(3 * embeddim + spacedim + 2 => embeddim, swish)
     ffs = [Dense(embeddim => embeddim, swish) for _ in 1:layers]
-    decode_means = Chain(Dense(embeddim => embeddim, swish),Dense(embeddim => spacedim * n_gaussians))
-    decode_log_variances = Chain(Dense(embeddim => embeddim, swish), Dense(embeddim => spacedim * n_gaussians))
-    decode_log_weights = Chain(Dense(embeddim => embeddim, swish),Dense(embeddim => n_gaussians))
-    layers = (; embed_time_t, embed_time_s, embed_state, projection_layer, ffs, decode_means, decode_log_variances, decode_log_weights)
+    decode_means       = Chain(Dense(embeddim => embeddim, swish), Dense(embeddim => D * n_gaussians))
+    decode_log_diag    = Chain(Dense(embeddim => embeddim, swish), Dense(embeddim => D * n_gaussians))
+    decode_tril        = Chain(Dense(embeddim => embeddim, swish), Dense(embeddim => n_off * n_gaussians))
+    decode_log_weights = Chain(Dense(embeddim => embeddim, swish), Dense(embeddim => n_gaussians))
+    layers = (; embed_time_t, embed_time_s, embed_state, projection_layer, ffs,
+              decode_means, decode_log_diag, decode_tril, decode_log_weights)
     TransMogModel(layers)
 end
 
+# Forward returns (means, log_diag, tril_off, log_weights).
+#   means     : (D·K, B)  — component means
+#   log_diag  : (D·K, B)  — log of Cholesky diagonal, i.e. log L_ii
+#   tril_off  : (D(D-1)/2 · K, B) — strict lower-triangular entries, row-major packed
+#   log_weights : (K, B)  — mixture logits
 function (f::TransMogModel)(s, t, Xs)
     l = f.layers
     sXs = tensor(Xs)
@@ -41,19 +51,15 @@ function (f::TransMogModel)(s, t, Xs)
     for ff in l.ffs
         x = x .+ ff(x)
     end
-    return l.decode_means(x), l.decode_log_variances(x), l.decode_log_weights(x)
+    return l.decode_means(x), l.decode_log_diag(x), l.decode_tril(x), l.decode_log_weights(x)
 end
 
 # ============================================================
-# Endpoint distributions and reference bridge sampler (§3, §10 step 3)
+# Endpoint distributions and reference bridge sampler
 # ============================================================
-# `sampleP` samples the prior X_0 ~ P, `sampleQ` samples the target X_1 ~ Q.
 sampleP(n) = rand(Float32, 2, n) .+ 2f0
 sampleQ(n) = Flowfusion.random_literal_cat(n, sigma = 0.05f0)
 
-# Reference bridge: Brownian bridge on [0,1] pinned at Y_0 and Y_1 with diffusion σ.
-# Y_t = (1-t) Y_0 + t Y_1 + ε,  ε ~ N(0, σ² t(1-t) I).
-# Only Y_0 and Y_t are fed to the model; Y_1 is used solely to simulate the bridge.
 function sample_bridge_batch(batch_size; σ = 0.15f0)
     Y0 = sampleP(batch_size)
     Y1 = sampleQ(batch_size)
@@ -66,39 +72,89 @@ function sample_bridge_batch(batch_size; σ = 0.15f0)
 end
 
 # ============================================================
-# MoG utilities
+# Cholesky / lower-triangular helpers — generic in D.
+# Off-diagonal entries are packed row-major: tril_off[pack(i,j)] stores L[i,j] for j < i.
+# ============================================================
+@inline pack_tril_idx(i, j) = (i - 1) * (i - 2) ÷ 2 + j
+
+# Clamp on log L_ii: L_ii ∈ [e^-7, e^3] ≈ [9e-4, 20] — sane range for the 2D toy.
+const LOG_DIAG_CLAMP_LO = -7f0
+const LOG_DIAG_CLAMP_HI =  3f0
+
+# y = L⁻¹ * b via forward substitution, where L is lower triangular with L_ii = exp(log_diag_i).
+# Shapes: log_diag (D, K, B), tril_off (n_off, K, B), b (D, K, B) → y (D, K, B).
+function chol_solve_tril(log_diag, tril_off, b)
+    D = size(b, 1)
+    diag_L = exp.(log_diag)
+    ybuf = Zygote.Buffer(b)
+    for i in 1:D
+        acc = b[i, :, :]
+        for j in 1:i-1
+            idx = pack_tril_idx(i, j)
+            acc = acc .- tril_off[idx, :, :] .* ybuf[j, :, :]
+        end
+        ybuf[i, :, :] = acc ./ diag_L[i, :, :]
+    end
+    return copy(ybuf)
+end
+
+# z = L * ε for a chosen component — per-batch L parameterized by log_diag (D, B) and tril_off (n_off, B).
+function chol_mul_tril(log_diag, tril_off, ε)
+    D = size(ε, 1)
+    diag_L = exp.(log_diag)
+    zbuf = Zygote.Buffer(ε)
+    for i in 1:D
+        acc = diag_L[i, :] .* ε[i, :]
+        for j in 1:i-1
+            idx = pack_tril_idx(i, j)
+            acc = acc .+ tril_off[idx, :] .* ε[j, :]
+        end
+        zbuf[i, :] = acc
+    end
+    return copy(zbuf)
+end
+
+# ============================================================
+# MoG utilities (full-covariance via Cholesky)
 # ============================================================
 
-# Stable diagonal-Gaussian mixture log-density (§11.1). Returns (B,).
-function mog_logpdf_diag(Xt, means, logvars, logweights)
+# Stable log-density of a diagonal-Cholesky-covariance MoG. Returns (B,).
+function mog_logpdf_chol(Xt, means, log_diag, tril_off, logweights)
     K, B = size(logweights)
     D    = size(means, 1) ÷ K
-    μ  = reshape(means,   D, K, B)
-    lv = clamp.(reshape(logvars, D, K, B), -15f0, 15f0)
+    n_off = size(tril_off, 1) ÷ K
+    μ  = reshape(means,    D, K, B)
+    ld = clamp.(reshape(log_diag, D, K, B), LOG_DIAG_CLAMP_LO, LOG_DIAG_CLAMP_HI)
+    tr = reshape(tril_off, n_off, K, B)
     x  = reshape(Xt, D, 1, B)
-    invσ2 = exp.(-lv)
-    quad   = sum((x .- μ) .^ 2 .* invσ2; dims = 1)   # (1, K, B)
-    logdet = sum(lv; dims = 1)                        # (1, K, B)
+    diff = x .- μ                                       # (D, K, B) via broadcast
+    y = chol_solve_tril(ld, tr, diff)                   # (D, K, B)
+    mahal   = dropdims(sum(y .^ 2; dims = 1); dims = 1) # (K, B)
+    log_det = 2f0 .* dropdims(sum(ld; dims = 1); dims = 1)  # (K, B)  — Σ log|Σ_k| = 2 Σ log L_ii
     c = Float32(D) * log(2f0 * Float32(π))
-    logcomp = -0.5f0 .* dropdims(quad .+ logdet .+ c; dims = 1)  # (K, B)
-    logπ    = Flux.logsoftmax(logweights; dims = 1)              # (K, B)
-    return vec(Flux.logsumexp(logπ .+ logcomp; dims = 1))        # (B,)
+    logcomp = -0.5f0 .* (mahal .+ log_det .+ c)         # (K, B)
+    logπ    = Flux.logsoftmax(logweights; dims = 1)     # (K, B)
+    return vec(Flux.logsumexp(logπ .+ logcomp; dims = 1))  # (B,)
 end
 
-# Stable log-mean-exp over a Vector of (B,) log-density vectors (§11.2).
+# Stable log-mean-exp across a Vector of (B,) log-density vectors.
 function logmeanexp_stack(logvals)
-    cols = [reshape(v, :, 1) for v in logvals]       # each (B, 1)
-    A    = reduce(hcat, cols)                        # (B, M)
-    m    = maximum(A; dims = 2)                      # (B, 1)
-    vec(m .+ log.(mean(exp.(A .- m); dims = 2)))     # (B,)
+    cols = [reshape(v, :, 1) for v in logvals]
+    A    = reduce(hcat, cols)
+    m    = maximum(A; dims = 2)
+    vec(m .+ log.(mean(exp.(A .- m); dims = 2)))
 end
 
-# Device-agnostic MoG sampler (unchanged).
-function sample_mog(means, log_variances, log_weights)
+# Device-agnostic MoG sampler with Cholesky covariance.
+function sample_mog(means, log_diag, tril_off, log_weights)
     K, B = size(log_weights)
-    D = size(means, 1) ÷ K
+    D    = size(means, 1) ÷ K
+    n_off = size(tril_off, 1) ÷ K
     μ_r  = reshape(means, D, K, B)
-    lv_r = clamp.(reshape(log_variances, D, K, B), -15f0, 15f0)
+    ld_r = clamp.(reshape(log_diag, D, K, B), LOG_DIAG_CLAMP_LO, LOG_DIAG_CLAMP_HI)
+    tr_r = reshape(tril_off, n_off, K, B)
+
+    # Gumbel-max component selection
     u = similar(log_weights); rand!(u)
     u = clamp.(u, 1f-7, 1f0 - 1f-7)
     g = -log.(-log.(u))
@@ -107,50 +163,45 @@ function sample_mog(means, log_variances, log_weights)
     mask = Float32.(scores .>= max_vals)
     mask = mask ./ sum(mask; dims = 1)
     mask_r = reshape(mask, 1, K, B)
-    μ_sel  = dropdims(sum(μ_r  .* mask_r; dims = 2); dims = 2)
-    lv_sel = dropdims(sum(lv_r .* mask_r; dims = 2); dims = 2)
+
+    μ_sel  = dropdims(sum(μ_r  .* mask_r; dims = 2); dims = 2)      # (D, B)
+    ld_sel = dropdims(sum(ld_r .* mask_r; dims = 2); dims = 2)      # (D, B)
+    tr_sel = dropdims(sum(tr_r .* mask_r; dims = 2); dims = 2)      # (n_off, B)
+
     ε = similar(μ_sel); randn!(ε)
-    μ_sel .+ exp.(0.5f0 .* lv_sel) .* ε
+    z = chol_mul_tril(ld_sel, tr_sel, ε)                            # (D, B)
+    return μ_sel .+ z
 end
 
 # Detached kernel sampler, no gradient flow.
 function sample_kernel_detached(model, s, t, Xs)
     Zygote.ignore_derivatives() do
-        μ, lv, lw = model(s, t, ContinuousState(Xs))
-        sample_mog(μ, lv, lw)
+        μ, ld, tr, lw = model(s, t, ContinuousState(Xs))
+        sample_mog(μ, ld, tr, lw)
     end
 end
 
 # ============================================================
-# Losses (§5, §8)
+# Losses
 # ============================================================
 
-# Bridge-sampled maximum likelihood: L_MLE = -E[log K^θ_{0,t}(Y_t | Y_0)] (§5).
 function bridge_mle_loss(model, Y0, t, Yt)
     s = Zygote.ignore_derivatives(() -> fill!(similar(t), 0f0))
-    μ, lv, lw = model(s, t, ContinuousState(Y0))
-    -mean(mog_logpdf_diag(Yt, μ, lv, lw))
+    μ, ld, tr, lw = model(s, t, ContinuousState(Y0))
+    -mean(mog_logpdf_chol(Yt, μ, ld, tr, lw))
 end
 
-# Chapman–Kolmogorov log-gap regularizer (§6–§8).
-#   teacher  : direct kernel  K^θ_{s,t}( · | x_s) — sampled x_t detached
-#   student  : composed kernel ∫ K^θ_{u,t}(·|x_u) K^{θ,sg}_{s,u}(x_u|x_s) dx_u
-#              estimated by log( (1/M) Σ_m K^θ_{u,t}(x_t|x_u^{(m)}) ), first leg detached.
-# Loss is E[ log K_dir(x_t|x_s) - log K̂_cmp(x_t|x_s) ], a plug-in KL estimator.
 function ck_loggap_loss(model, Xs, s, u, t; n_middle = 4)
-    # (1) Detached teacher sample x_t ~ K_{s,t}(·|x_s).
     Xt = Zygote.ignore_derivatives() do
-        μ_dir, lv_dir, lw_dir = model(s, t, ContinuousState(Xs))
-        sample_mog(μ_dir, lv_dir, lw_dir)
+        μ_dir, ld_dir, tr_dir, lw_dir = model(s, t, ContinuousState(Xs))
+        sample_mog(μ_dir, ld_dir, tr_dir, lw_dir)
     end
-    # (2) Tracked direct log-density.
-    μ_dir, lv_dir, lw_dir = model(s, t, ContinuousState(Xs))
-    logp_dir = mog_logpdf_diag(Xt, μ_dir, lv_dir, lw_dir)
-    # (3) Monte Carlo composition estimate — first leg detached, second leg tracked.
+    μ_dir, ld_dir, tr_dir, lw_dir = model(s, t, ContinuousState(Xs))
+    logp_dir = mog_logpdf_chol(Xt, μ_dir, ld_dir, tr_dir, lw_dir)
     log_terms = [begin
         Xu = sample_kernel_detached(model, s, u, Xs)
-        μ_c, lv_c, lw_c = model(u, t, ContinuousState(Xu))
-        mog_logpdf_diag(Xt, μ_c, lv_c, lw_c)
+        μ_c, ld_c, tr_c, lw_c = model(u, t, ContinuousState(Xu))
+        mog_logpdf_chol(Xt, μ_c, ld_c, tr_c, lw_c)
     end for _ in 1:n_middle]
     logp_cmp = logmeanexp_stack(log_terms)
     mean(logp_dir .- logp_cmp)
@@ -185,20 +236,17 @@ function train_kernel!(model;
     ck_losses  = Float32[]
     prog = Progress(n_epochs * iters_per_epoch; desc = "Training kernel", showspeed = true)
     for epoch in 1:n_epochs
-        # Warmup on MLE only (§9), then linearly ramp λ_ck.
         λ_ck = if epoch <= warmup_epochs
             0f0
         else
             Float32(λ_ck_max * min(1f0, (epoch - warmup_epochs) / max(1, n_epochs - warmup_epochs)))
         end
         for i in 1:iters_per_epoch
-            # --- MLE batch: bridge samples (Y_0, t, Y_t)
             Y0_cpu, _Y1, t_mle_cpu, Yt_cpu = sample_bridge_batch(batch_size; σ = σ_bridge)
             Y0    = Y0_cpu    |> gpu
             t_mle = t_mle_cpu |> gpu
             Yt    = Yt_cpu    |> gpu
 
-            # --- CK batch: times 0 ≤ s ≤ u ≤ t ≤ 1, state X_s from a detached K_{0,s}.
             s_cpu, u_cpu, t_ck_cpu = sample_times(batch_size)
             s    = s_cpu    |> gpu
             u    = u_cpu    |> gpu
@@ -217,7 +265,6 @@ function train_kernel!(model;
             end
             Flux.update!(opt_state, model, g[1])
 
-            # Track components separately for diagnostics.
             L_mle_val = bridge_mle_loss(model, Y0, t_mle, Yt) |> cpu
             push!(mle_losses, Float32(L_mle_val))
             push!(ck_losses,  λ_ck > 0 ? Float32(l - λ_mle * L_mle_val) / max(λ_ck, 1f-8) : 0f0)
@@ -241,17 +288,14 @@ end
 # ============================================================
 # Inference
 # ============================================================
-
-# Real objective: one-shot pushforward through K^θ_{0,1}.
 function generate_oneshot(model, X0)
     B = size(X0, 2)
     s = fill!(similar(X0, B), 0f0)
     t = fill!(similar(X0, B), 1f0)
-    μ, lv, lw = model(s, t, ContinuousState(X0))
-    sample_mog(μ, lv, lw)
+    μ, ld, tr, lw = model(s, t, ContinuousState(X0))
+    sample_mog(μ, ld, tr, lw)
 end
 
-# Multi-step rollout: semigroup-consistency diagnostic only.
 function generate(model, X0; n_steps = 100)
     ts = Float32.(range(0f0, 1f0, length = n_steps + 1))
     X = X0
@@ -259,8 +303,8 @@ function generate(model, X0; n_steps = 100)
         B = size(X, 2)
         s = fill(ts[i],   B)
         t = fill(ts[i+1], B)
-        μ, lv, lw = model(s, t, ContinuousState(X))
-        X = sample_mog(μ, lv, lw)
+        μ, ld, tr, lw = model(s, t, ContinuousState(X))
+        X = sample_mog(μ, ld, tr, lw)
     end
     return X
 end
